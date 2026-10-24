@@ -28,6 +28,8 @@ export interface SidebarItem {
 export interface FrameState {
   step: number;
   demo?: boolean;
+  /** Work folder, shown next to the logo. */
+  folder?: string;
   sidebar: { title: string; items: SidebarItem[] }[];
 }
 
@@ -65,7 +67,7 @@ export function Frame({
   hint?: string;
 }) {
   const { columns, rows } = useWindowSize();
-  const { step, demo, sidebar } = useContext(FrameContext);
+  const { step, demo, folder, sidebar } = useContext(FrameContext);
   const showSidebar = columns >= 80 && sidebar.some((s) => s.items.length);
   const sideW = Math.min(30, Math.max(22, Math.floor(columns * 0.24)));
 
@@ -85,7 +87,7 @@ export function Frame({
           <Text color={c.brand} bold>
             ◆ molly
           </Text>
-          {demo ? <Text color={c.dim}>  demo · fake repos, fake keys</Text> : null}
+          {demo ? <Text color={c.dim}>  demo · fake repos, fake keys</Text> : folder ? <Text color={c.dim}>  {folder}</Text> : null}
         </Text>
         <Stepper step={step} compact={columns < 100} />
       </Box>

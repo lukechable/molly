@@ -1,4 +1,5 @@
 import { Box, Text, useApp, useInput, usePaste, useWindowSize } from 'ink';
+import Spinner from 'ink-spinner';
 import TextInput from 'ink-text-input';
 import os from 'node:os';
 import path from 'node:path';
@@ -116,8 +117,8 @@ export function Session({ rt, existing, askFolder, roots: presetRoots, opts, ope
       const rs = drafts.map((d) => results[d.cred.id]?.outcome);
       if (drafts.some((d) => d.cred.platform === current) && rs.some((r) => !r)) return 'active';
       if (rs.some((r) => r === 'failed' || r === 'partial')) return 'warn';
-      if (rs.every((r) => r === 'rolled')) return 'done';
       if (rs.every((r) => r === 'skipped')) return 'skipped';
+      if (rs.every((r) => r === 'rolled' || r === 'skipped')) return 'done';
       return 'pending';
     };
     const repos = (scan?.repos ?? [])
@@ -129,12 +130,21 @@ export function Session({ rt, existing, askFolder, roots: presetRoots, opts, ope
     return {
       step: STEP_OF[phase],
       demo: rt.demo,
+      folder: roots.length ? roots.map(tildify).join(', ') : undefined,
       sidebar: [
         { title: 'Repos', items: repos },
         { title: 'Platforms', items: platforms },
       ],
     };
-  }, [phase, scan, chosen, queueIndex, results]);
+  }, [phase, scan, chosen, queueIndex, results, roots]);
+
+  // Keep the terminal tab's title useful while Molly runs in the background.
+  useEffect(() => {
+    const p = queue[queueIndex]?.provider.name;
+    const title =
+      phase === 'platform' && p ? `molly · ${p} ${queueIndex + 1}/${queue.length}` : phase === 'summary' ? 'molly · done' : 'molly';
+    process.stdout.write(`\x1b]0;${title}\x07`);
+  }, [phase, queueIndex]);
 
   return (
     <FrameContext.Provider value={frame}>
@@ -767,6 +777,8 @@ function PlatformScreen({
     Object.fromEntries(drafts.map((d) => [d.cred.id, { status: 'pending', seen: [], targets: {}, followUps: [] }])),
   );
   const prepFailures = useRef<Record<string, string>>({});
+  const skipRest = useRef(false);
+  const [skipping, setSkipping] = useState(false);
   const q = questions[qIndex];
   const [qCursor, setQCursor] = useCursor(q?.q.options.length ?? 0, mode === 'question');
 
@@ -806,6 +818,10 @@ function PlatformScreen({
         setViews(latest);
       };
       for (const d of drafts) {
+        if (skipRest.current) {
+          update((v) => ({ ...v, [d.cred.id]: { ...v[d.cred.id], status: 'skipped', message: 'skipped by you' } }));
+          continue;
+        }
         if (prepFailures.current[d.cred.id]) {
           update((v) => ({ ...v, [d.cred.id]: { ...v[d.cred.id], status: 'failed', message: prepFailures.current[d.cred.id] } }));
           continue;
@@ -883,26 +899,45 @@ function PlatformScreen({
   }
 
   const done = mode === 'result';
-  const allOk = drafts.every((d) => views[d.cred.id].status === 'rolled');
+  const statuses = drafts.map((d) => views[d.cred.id].status);
+  const allOk = statuses.every((st) => st === 'rolled' || st === 'skipped') && statuses.includes('rolled');
+  const skippedCount = statuses.filter((st) => st === 'skipped').length;
   const followUps = drafts.flatMap((d) => views[d.cred.id].followUps);
   const revoked = drafts.some((d) => views[d.cred.id].seen.includes('revoke'));
   const budget = Math.max(3, height - 18 - drafts.length * 3);
+  // Keys still queued behind the one in progress (before the first starts, it's about to).
+  const pending = drafts.filter((d) => views[d.cred.id].status === 'pending').length;
+  const remaining = drafts.some((d) => views[d.cred.id].status === 'active') ? pending : Math.max(0, pending - 1);
 
   return (
     <Frame
-      buttons={done ? [{ label: next ? `Next: ${next} →` : 'See summary →', primary: true, onPress: () => onDone(resultsFrom(views)) }] : []}
-      hint={done ? undefined : 'working…'}
+      buttons={
+        done
+          ? [{ label: next ? `Next: ${next} →` : 'See summary →', primary: true, onPress: () => onDone(resultsFrom(views)) }]
+          : remaining > 0
+            ? [
+                {
+                  label: skipping ? 'Skipping the rest…' : `Skip the other ${plural(remaining, 'key')}`,
+                  hotkey: 's',
+                  disabled: skipping,
+                  onPress: () => ((skipRest.current = true), setSkipping(true)),
+                },
+              ]
+            : []
+      }
+      hint={done ? undefined : 'the key in progress always finishes safely'}
     >
       {header}
       {done ? (
         <Box marginBottom={1} flexDirection="column">
           <Card tone={allOk ? 'ok' : 'warn'}>
             <Text bold color={allOk ? c.ok : c.warn}>
-              {allOk ? `✓ ${provider.name} rotated` : `◐ ${provider.name} needs attention`}
+              {allOk ? `✓ ${provider.name} rotated` : statuses.every((st) => st === 'skipped') ? `– ${provider.name} skipped` : `◐ ${provider.name} needs attention`}
             </Text>
             {allOk ? (
               <Text color={c.dim}>
-                {drafts.length === 1 ? 'New key' : `${drafts.length} new keys`} in {plural(places, 'place')}
+                {drafts.length - skippedCount === 1 ? 'New key' : `${drafts.length - skippedCount} new keys`}
+                {skippedCount ? ` · ${skippedCount} skipped` : ` in ${plural(places, 'place')}`}
                 {revoked ? ' · old key revoked' : ''}
               </Text>
             ) : null}
@@ -956,6 +991,7 @@ function CredCard({ cred, view, compact, budget }: { cred: CredentialSpec; view:
   const targets = cred.targets.map((t, i) => ({ t, s: view.targets[i] }));
   const failedFirst = [...targets.filter((x) => x.s?.status === 'error'), ...targets.filter((x) => x.s?.status !== 'error')];
   const shown = failedFirst.slice(0, budget);
+  const inFlight = view.step === 'propagate' && !finished ? targets.findIndex((x) => !x.s) : -1;
 
   return (
     <Box marginBottom={1} flexDirection="column">
@@ -981,7 +1017,8 @@ function CredCard({ cred, view, compact, budget }: { cred: CredentialSpec; view:
             <Bar value={ok} total={total} />
             {shown.map(({ t, s }, i) => (
               <Text key={i} color={s?.status === 'error' ? c.err : c.dim} wrap="truncate-end">
-                {s ? s.status === 'ok' ? <Text color={c.ok}>✓</Text> : '✗' : '·'} {tildify(describeTarget(t))}  {t.key}
+                {s ? s.status === 'ok' ? <Text color={c.ok}>✓</Text> : '✗' : targets.indexOf(shown[i]) === inFlight ? <Text color={c.brand}><Spinner type="dots" /></Text> : '·'}{' '}
+                <Text color={targets.indexOf(shown[i]) === inFlight ? '#E8E6EF' : undefined}>{tildify(describeTarget(t))}</Text>  {t.key}
                 {s?.message ? `: ${s.message}` : ''}
               </Text>
             ))}
