@@ -55,7 +55,7 @@ async function requireConfig(): Promise<MollyConfig | null> {
 
 const program = new Command()
   .name('molly')
-  .description('Roll every API key and secret you own, and update every repo that uses them.')
+  .description('Rotate the API keys and secrets for all your projects at once. Run `molly` and follow along.')
   .version('0.1.0');
 
 const rollOptions = (cmd: Command) =>
