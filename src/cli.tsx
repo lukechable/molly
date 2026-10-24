@@ -8,6 +8,7 @@ import { liveRuntime, type Runtime } from './core/runtime.js';
 import { authKey } from './core/store.js';
 import { createDemoWorkspace, demoRuntime } from './demo.js';
 import { plainRoll } from './plain.js';
+import { MouseInput, MouseProvider } from './ui/mouse.js';
 import { Session } from './ui/Session.js';
 import { Status } from './ui/Status.js';
 
@@ -32,10 +33,17 @@ async function runSession(rt: Runtime, opts: RollOptions & { plain?: boolean }, 
     return;
   }
   let code = 0;
+  const mouse = new MouseInput();
+  process.once('exit', () => mouse.stop());
   const app = render(
-    <Session rt={rt} existing={existing} opts={opts} openUrl={openUrl} onExit={(c) => (code = c)} {...extra} />,
+    <MouseProvider input={mouse}>
+      <Session rt={rt} existing={existing} opts={opts} openUrl={openUrl} onExit={(c) => (code = c)} {...extra} />
+    </MouseProvider>,
+    { stdin: mouse.stdin, alternateScreen: true, incrementalRendering: true },
   );
+  mouse.start();
   await app.waitUntilExit();
+  mouse.stop();
   process.exitCode = code;
 }
 

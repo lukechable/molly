@@ -1,11 +1,10 @@
-import { Box, Text, useApp, useInput, usePaste } from 'ink';
-import Spinner from 'ink-spinner';
+import { Box, Text, useApp, useInput, usePaste, useWindowSize } from 'ink';
 import TextInput from 'ink-text-input';
 import os from 'node:os';
 import path from 'node:path';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { saveConfig, tildify, type CredentialSpec, type MollyConfig } from '../core/config.js';
-import { linkRemotes, scanLocal, type Discovery, type Draft } from '../core/discover.js';
+import { linkRemotes, scanLocal, type Discovery, type Draft, type RepoInfo } from '../core/discover.js';
 import { rollCredential, type RollEvent, type RollOptions, type Step } from '../core/engine.js';
 import { suggestFolders } from '../core/folders.js';
 import { providerContext, resolveAuthWithSource, type Runtime } from '../core/runtime.js';
@@ -14,10 +13,14 @@ import { authKey } from '../core/store.js';
 import { plural } from '../core/util.js';
 import { CATEGORIES, type Provider, type Question } from '../providers/types.js';
 import { describeTarget } from '../targets/types.js';
-import { color, Confirm, GroupedMultiSelect, Header, Hints, Select, Working } from './components.js';
+import { Bar, Busy, c, Card, Chip, Frame, FrameContext, Row, Scroll, Title, type FrameState, type SidebarItem } from './kit.js';
+import { useMouseInput } from './mouse.js';
 
 type Phase = 'folder' | 'scan' | 'overview' | 'choose' | 'hosts' | 'link' | 'platform' | 'redeploy' | 'summary';
 type Outcome = 'rolled' | 'partial' | 'failed' | 'skipped';
+type Results = Record<string, { outcome: Outcome; note?: string; followUps: string[] }>;
+
+const STEP_OF: Record<Phase, number> = { folder: 0, scan: 0, overview: 1, choose: 1, hosts: 2, link: 2, platform: 2, redeploy: 3, summary: 3 };
 
 export interface SessionProps {
   rt: Runtime;
@@ -32,8 +35,32 @@ export interface SessionProps {
 }
 
 const expand = (p: string) => path.resolve(p.trim().replace(/^~(?=$|\/)/, os.homedir()));
-const categoryOrder = (p: Provider) => CATEGORIES.findIndex((c) => c.id === p.category);
+const categoryOrder = (p: Provider) => CATEGORIES.findIndex((cat) => cat.id === p.category);
 const serviceName = (rt: Runtime, d: Draft) => (d.cred.platform === 'generated' ? d.cred.label : rt.registry[d.cred.platform].name);
+const touches = (d: Draft, repo: RepoInfo) => d.hits.some((h) => h.repo === repo);
+/** Pads or truncates to exactly `n` columns. */
+const fit = (s: string, n: number) => (s.length > n - 1 ? s.slice(0, n - 2) + '… ' : s.padEnd(n));
+
+/** ↑/↓ (and j/k) over `count` items. */
+function useCursor(count: number, active = true) {
+  const [cursor, setCursor] = useState(0);
+  useInput(
+    (input, key) => {
+      if (!count) return;
+      if (key.upArrow || input === 'k') setCursor((i) => (i - 1 + count) % count);
+      if (key.downArrow || input === 'j') setCursor((i) => (i + 1) % count);
+    },
+    { isActive: active },
+  );
+  return [Math.min(cursor, Math.max(0, count - 1)), setCursor] as const;
+}
+
+/** The slice of a long list that fits, keeping `cursor` visible. */
+function visible<T>(items: T[], cursor: number, max: number) {
+  if (items.length <= max) return { start: 0, items };
+  const start = Math.max(0, Math.min(cursor - Math.floor(max / 2), items.length - max));
+  return { start, items: items.slice(start, start + max) };
+}
 
 export function Session({ rt, existing, askFolder, roots: presetRoots, opts, openUrl, onExit }: SessionProps) {
   const { exit } = useApp();
@@ -44,7 +71,7 @@ export function Session({ rt, existing, askFolder, roots: presetRoots, opts, ope
   const [chosen, setChosen] = useState<Draft[]>([]);
   const [hosts, setHosts] = useState<string[]>([]);
   const [queueIndex, setQueueIndex] = useState(0);
-  const [outcomes, setOutcomes] = useState<Record<string, { outcome: Outcome; note?: string; followUps: string[] }>>({});
+  const [results, setResults] = useState<Results>({});
   const [redeploys, setRedeploys] = useState<string[]>([]);
   const config = useRef<MollyConfig | null>(null);
   const touched = useRef(new Map<string, { projectId: string; teamId?: string; name: string }>());
@@ -60,7 +87,6 @@ export function Session({ rt, existing, askFolder, roots: presetRoots, opts, ope
   const auto = useMemo(() => (scan?.drafts ?? []).filter((d) => rt.registry[d.cred.platform].mode === 'auto'), [scan]);
   const manual = useMemo(() => (scan?.drafts ?? []).filter((d) => rt.registry[d.cred.platform].mode === 'guided'), [scan]);
 
-  // One step per platform, in a stable order.
   const queue = useMemo(() => {
     const by = new Map<string, Draft[]>();
     for (const d of chosen) by.set(d.cred.platform, [...(by.get(d.cred.platform) ?? []), d]);
@@ -81,27 +107,49 @@ export function Session({ rt, existing, askFolder, roots: presetRoots, opts, ope
     if (config.current) await saveConfig(config.current);
   };
 
-  const startRotating = (drafts: Draft[]) => {
-    setChosen(drafts);
-    setPhase('hosts');
-  };
+  // Sidebar: repos and platforms with live status.
+  const frame: FrameState = useMemo(() => {
+    const rotating = phase === 'platform' || phase === 'redeploy' || phase === 'summary';
+    const current = phase === 'platform' ? queue[queueIndex]?.provider.id : undefined;
+    const statusOf = (drafts: Draft[]): SidebarItem['status'] => {
+      if (!drafts.length) return 'info';
+      const rs = drafts.map((d) => results[d.cred.id]?.outcome);
+      if (drafts.some((d) => d.cred.platform === current) && rs.some((r) => !r)) return 'active';
+      if (rs.some((r) => r === 'failed' || r === 'partial')) return 'warn';
+      if (rs.every((r) => r === 'rolled')) return 'done';
+      if (rs.every((r) => r === 'skipped')) return 'skipped';
+      return 'pending';
+    };
+    const repos = (scan?.repos ?? [])
+      .filter((r) => [...auto, ...manual].some((d) => touches(d, r)))
+      .map((r) => ({ label: r.name, status: rotating ? statusOf(chosen.filter((d) => touches(d, r))) : ('info' as const) }));
+    const platforms = rotating || phase === 'hosts' || phase === 'link'
+      ? queue.map((q) => ({ label: q.provider.name, status: statusOf(q.drafts) }))
+      : [];
+    return {
+      step: STEP_OF[phase],
+      demo: rt.demo,
+      sidebar: [
+        { title: 'Repos', items: repos },
+        { title: 'Platforms', items: platforms },
+      ],
+    };
+  }, [phase, scan, chosen, queueIndex, results]);
 
-  const subtitle = rt.demo ? 'demo · fake repos, fake keys' : undefined;
   return (
-    <Box flexDirection="column" paddingX={1}>
-      <Header subtitle={subtitle} />
-
+    <FrameContext.Provider value={frame}>
       {phase === 'folder' && (
-        <FolderStep
+        <FolderScreen
           onSubmit={(dir) => {
             setRoots([dir]);
             setPhase('scan');
           }}
+          onQuit={() => quit(0)}
         />
       )}
 
       {phase === 'scan' && (
-        <ScanStep
+        <ScanScreen
           rt={rt}
           roots={roots}
           onDone={(d) => {
@@ -113,38 +161,36 @@ export function Session({ rt, existing, askFolder, roots: presetRoots, opts, ope
       )}
 
       {phase === 'overview' && scan && (
-        <Overview
+        <OverviewScreen
           rt={rt}
           scan={scan}
           auto={auto}
           manual={manual}
           roots={roots}
-          onAll={() => startRotating(auto)}
+          onAll={() => {
+            setChosen(auto);
+            setPhase('hosts');
+          }}
           onChoose={() => setPhase('choose')}
+          onChangeFolder={() => setPhase('folder')}
           onQuit={() => quit(0)}
         />
       )}
 
       {phase === 'choose' && (
-        <Box flexDirection="column">
-          <Text bold>Which keys should Molly rotate?</Text>
-          <Box marginTop={1}>
-            <GroupedMultiSelect
-              groups={[...new Set(auto.map((d) => d.cred.platform))].map((id) => ({
-                title: rt.registry[id].name,
-                items: auto
-                  .filter((d) => d.cred.platform === id)
-                  .map((d) => ({ id: d.cred.id, label: d.cred.label, hint: `${plural(d.cred.targets.length, 'place')} · ${d.repos.join(', ')}` })),
-              }))}
-              initial={auto.map((d) => d.cred.id)}
-              onSubmit={(ids) => startRotating(auto.filter((d) => ids.includes(d.cred.id)))}
-            />
-          </Box>
-        </Box>
+        <ChooseScreen
+          rt={rt}
+          drafts={auto}
+          onSubmit={(ds) => {
+            setChosen(ds);
+            setPhase('hosts');
+          }}
+          onBack={() => setPhase('overview')}
+        />
       )}
 
       {phase === 'hosts' && (
-        <HostsStep
+        <HostsScreen
           rt={rt}
           needed={neededHosts}
           openUrl={openUrl}
@@ -156,7 +202,7 @@ export function Session({ rt, existing, askFolder, roots: presetRoots, opts, ope
       )}
 
       {phase === 'link' && scan && (
-        <LinkStep
+        <LinkScreen
           rt={rt}
           scan={scan}
           hosts={hosts}
@@ -174,7 +220,7 @@ export function Session({ rt, existing, askFolder, roots: presetRoots, opts, ope
       )}
 
       {phase === 'platform' && queue[queueIndex] && config.current && (
-        <PlatformStep
+        <PlatformScreen
           key={queue[queueIndex].provider.id}
           rt={rt}
           index={queueIndex}
@@ -187,8 +233,9 @@ export function Session({ rt, existing, askFolder, roots: presetRoots, opts, ope
           save={save}
           openUrl={openUrl}
           next={queue[queueIndex + 1]?.provider.name}
-          onDone={(results) => {
-            setOutcomes((o) => ({ ...o, ...results }));
+          onProgress={(r) => setResults((o) => ({ ...o, ...r }))}
+          onDone={(r) => {
+            setResults((o) => ({ ...o, ...r }));
             if (queueIndex + 1 < queue.length) setQueueIndex(queueIndex + 1);
             else setPhase(touched.current.size ? 'redeploy' : 'summary');
           }}
@@ -196,7 +243,7 @@ export function Session({ rt, existing, askFolder, roots: presetRoots, opts, ope
       )}
 
       {phase === 'redeploy' && (
-        <RedeployStep
+        <RedeployScreen
           rt={rt}
           projects={[...touched.current.values()]}
           onDone={(lines) => {
@@ -207,26 +254,29 @@ export function Session({ rt, existing, askFolder, roots: presetRoots, opts, ope
       )}
 
       {phase === 'summary' && scan && (
-        <Summary
+        <SummaryScreen
           rt={rt}
           scan={scan}
           chosen={chosen}
           manual={manual}
-          outcomes={outcomes}
+          results={results}
           redeploys={redeploys}
-          onExit={() => quit(Object.values(outcomes).some((o) => o.outcome === 'failed' || o.outcome === 'partial') ? 1 : 0)}
+          onExit={() => quit(Object.values(results).some((o) => o.outcome === 'failed' || o.outcome === 'partial') ? 1 : 0)}
         />
       )}
-    </Box>
+    </FrameContext.Provider>
   );
 }
 
 // ─── 1. Folder ─────────────────────────────────────────────────────────────
 
-function FolderStep({ onSubmit }: { onSubmit: (dir: string) => void }) {
+function FolderScreen({ onSubmit, onQuit }: { onSubmit: (dir: string) => void; onQuit: () => void }) {
   const [options, setOptions] = useState<{ dir: string; repos: number }[] | null>(null);
   const [typing, setTyping] = useState(false);
   const [value, setValue] = useState('~/');
+  const rows = options ? [...options.slice(0, 8), { dir: '', repos: 0 }] : [];
+  const [cursor, setCursor] = useCursor(rows.length, !typing);
+
   useEffect(() => {
     suggestFolders([process.cwd()]).then((s) => {
       setOptions(s);
@@ -234,51 +284,67 @@ function FolderStep({ onSubmit }: { onSubmit: (dir: string) => void }) {
     });
   }, []);
 
+  const pick = (i: number) => (rows[i].dir ? onSubmit(rows[i].dir) : setTyping(true));
+  const submitTyped = () => value.trim() && onSubmit(expand(value));
+
   return (
-    <Box flexDirection="column">
-      <Text bold>Where do you keep your repos?</Text>
-      <Text color={color.dim}>
-        Molly will look through this folder for git repos and the API keys they use. Nothing leaves your machine until you say so.
-      </Text>
-      <Box marginTop={1} flexDirection="column">
-        {!options ? (
-          <Working label="Looking for folders with git repos…" />
-        ) : typing ? (
-          <Box flexDirection="column">
-            <Box>
-              <Text color={color.brand}>❯ </Text>
-              <TextInput value={value} onChange={setValue} onSubmit={(v) => v.trim() && onSubmit(expand(v))} />
-            </Box>
-            <Hints hints={[['enter', 'scan this folder']]} />
+    <Frame
+      typing={typing}
+      buttons={[
+        { label: typing ? 'Scan this folder' : 'Choose', primary: true, onPress: () => (typing ? submitTyped() : pick(cursor)) },
+        ...(typing && options?.length ? [{ label: 'Back', hotkey: 'esc', onPress: () => setTyping(false) }] : []),
+        { label: 'Quit', hotkey: typing ? undefined : 'q', onPress: onQuit },
+      ]}
+    >
+      <Title sub="Molly looks through it for git repos and the API keys they use. Nothing changes until you say so.">
+        Where do you keep your repos?
+      </Title>
+      {!options ? (
+        <Busy label="Looking for folders with git repos…" />
+      ) : typing ? (
+        <Card title="Folder path">
+          <Box>
+            <Text color={c.brand}>❯ </Text>
+            <TextInput value={value} onChange={setValue} onSubmit={submitTyped} />
           </Box>
-        ) : (
-          <Box flexDirection="column">
-            <Select
-              options={[
-                ...options.slice(0, 6).map((o) => ({ label: tildify(o.dir), value: o.dir, hint: plural(o.repos, 'repo') + (o.repos >= 2 ? '+' : '') })),
-                { label: 'Another folder…', value: '__other' },
-              ]}
-              onSubmit={(v) => (v === '__other' ? setTyping(true) : onSubmit(v))}
-            />
-            <Hints hints={[['↑↓', 'move'], ['enter', 'choose']]} />
-          </Box>
-        )}
-      </Box>
-    </Box>
+        </Card>
+      ) : (
+        <Box flexDirection="column">
+          {rows.map((o, i) => (
+            <Row key={o.dir || 'other'} active={i === cursor} onClick={() => (setCursor(i), pick(i))}>
+              {o.dir ? (
+                <Text>
+                  <Text bold={i === cursor}>{fit(tildify(o.dir), 40)}</Text>
+                  <Text color={c.dim}>{plural(o.repos, 'repo')}</Text>
+                  {i === 0 ? <Text color={c.ok}>  suggested</Text> : null}
+                </Text>
+              ) : (
+                <Text color={i === cursor ? undefined : c.dim}>Another folder…</Text>
+              )}
+            </Row>
+          ))}
+        </Box>
+      )}
+    </Frame>
   );
 }
 
-function ScanStep({ rt, roots, onDone }: { rt: Runtime; roots: string[]; onDone: (d: Discovery) => void }) {
+function ScanScreen({ rt, roots, onDone }: { rt: Runtime; roots: string[]; onDone: (d: Discovery) => void }) {
   const [msg, setMsg] = useState(`Scanning ${roots.map(tildify).join(', ')}…`);
   useEffect(() => {
     scanLocal(rt, roots, setMsg).then(onDone);
   }, []);
-  return <Working label={msg} />;
+  return (
+    <Frame>
+      <Title sub={roots.map(tildify).join(', ')}>Scanning your repos</Title>
+      <Busy label={msg} />
+    </Frame>
+  );
 }
 
 // ─── 2. What each repo uses ────────────────────────────────────────────────
 
-function Overview({
+function OverviewScreen({
   rt,
   scan,
   auto,
@@ -286,6 +352,7 @@ function Overview({
   roots,
   onAll,
   onChoose,
+  onChangeFolder,
   onQuit,
 }: {
   rt: Runtime;
@@ -295,100 +362,170 @@ function Overview({
   roots: string[];
   onAll: () => void;
   onChoose: () => void;
+  onChangeFolder: () => void;
   onQuit: () => void;
 }) {
+  const { rows: height } = useWindowSize();
   const rows = scan.repos
-    .map((repo) => {
-      const uses = (list: Draft[]) => [...new Set(list.filter((d) => d.hits.some((h) => h.repo === repo)).map((d) => serviceName(rt, d)))];
-      const where = [repo.github && 'GitHub', repo.vercel.length && 'Vercel'].filter(Boolean) as string[];
-      return { repo, rotatable: uses(auto), manualOnly: uses(manual), where };
-    })
+    .map((repo) => ({
+      repo,
+      rotatable: [...new Set(auto.filter((d) => touches(d, repo)).map((d) => serviceName(rt, d)))],
+      manualOnly: [...new Set(manual.filter((d) => touches(d, repo)).map((d) => serviceName(rt, d)))],
+      where: [repo.github && 'GitHub', repo.vercel.length && 'Vercel'].filter(Boolean) as string[],
+    }))
     .filter((r) => r.rotatable.length || r.manualOnly.length)
     .sort((a, b) => b.rotatable.length - a.rotatable.length);
-  const empty = scan.repos.length - rows.length;
-  const nameW = Math.min(28, Math.max(8, ...rows.map((r) => r.repo.name.length)) + 2);
-
-  useInput((input, key) => {
-    if (!auto.length) {
-      if (key.return || input === 'q') onQuit();
-      return;
-    }
-    if (key.return) onAll();
-    else if (input === 'c') onChoose();
-    else if (input === 'q' || key.escape) onQuit();
+  const [offset, setOffset] = useState(0);
+  const max = Math.max(3, height - 16);
+  const shown = rows.slice(offset, offset + max);
+  const scroll = (d: number) => setOffset((o) => Math.max(0, Math.min(rows.length - max, o + d)));
+  useInput((_i, key) => {
+    if (key.downArrow) scroll(1);
+    if (key.upArrow) scroll(-1);
   });
+  const nameW = Math.min(26, Math.max(10, ...rows.map((r) => r.repo.name.length)) + 2);
+  const services = new Set([...auto, ...manual].map((d) => serviceName(rt, d))).size;
+  const repoCount = new Set(auto.flatMap((d) => d.hits.map((h) => h.repo.root))).size;
 
   if (!rows.length) {
     return (
-      <Box flexDirection="column">
-        <Text color={color.warn}>No API keys found in {tildify(roots[0])}.</Text>
-        <Text color={color.dim}>Molly looks in .env, .env.local, .env.production and .dev.vars files (not .env.example).</Text>
-        <Hints hints={[['enter', 'exit']]} />
-      </Box>
+      <Frame
+        buttons={[
+          { label: 'Choose another folder', primary: true, onPress: onChangeFolder },
+          { label: 'Quit', hotkey: 'q', onPress: onQuit },
+        ]}
+      >
+        <Title sub="Molly looks in .env, .env.local, .env.production and .dev.vars files (not .env.example).">
+          No API keys found in {tildify(roots[0])}
+        </Title>
+      </Frame>
     );
   }
 
   return (
-    <Box flexDirection="column">
-      <Text bold>
-        {plural(rows.length, 'repo')} use {plural(new Set([...auto, ...manual].map((d) => serviceName(rt, d))).size, 'service')}
-      </Text>
-      <Box flexDirection="column" marginTop={1}>
-        {rows.map(({ repo, rotatable, manualOnly, where }) => (
-          <Text key={repo.root}>
-            <Text bold>{repo.name.slice(0, nameW - 2).padEnd(nameW)}</Text>
-            <Text color={color.ok}>{rotatable.join(' · ')}</Text>
-            {manualOnly.length ? <Text color={color.dim}>{rotatable.length ? ' · ' : ''}{manualOnly.join(' · ')}*</Text> : null}
-            {where.length ? <Text color={color.accent}>  → {where.join(', ')}</Text> : null}
-          </Text>
+    <Frame
+      buttons={[
+        ...(auto.length ? [{ label: `Rotate ${plural(auto.length, 'key')}`, primary: true, onPress: onAll }] : []),
+        ...(auto.length > 1 ? [{ label: 'Choose keys', hotkey: 'c', onPress: onChoose }] : []),
+        { label: 'Change folder', hotkey: 'f', onPress: onChangeFolder },
+        { label: 'Quit', hotkey: 'q', onPress: onQuit },
+      ]}
+    >
+      <Title sub={`Found in each repo's env files. Molly rotates the green ones through each platform's API, ${repoCount ? `across ${plural(repoCount, 'repo')}` : ''}.`}>
+        {plural(rows.length, 'repo')} use {plural(services, 'service')}
+      </Title>
+      <Scroll onScroll={scroll}>
+        {shown.map(({ repo, rotatable, manualOnly, where }) => (
+          <Box key={repo.root} marginBottom={1}>
+            <Box width={nameW} flexShrink={0}>
+              <Text bold wrap="truncate-end">
+                {repo.name}
+              </Text>
+            </Box>
+            <Box flexGrow={1} flexWrap="wrap">
+              {rotatable.map((s) => (
+                <Chip key={s} label={s} />
+              ))}
+              {manualOnly.map((s) => (
+                <Chip key={s} label={`${s}*`} tone="dim" />
+              ))}
+            </Box>
+            {where.length ? (
+              <Box flexShrink={0}>
+                <Text color={c.accent}>→ {where.join(' · ')}</Text>
+              </Box>
+            ) : null}
+          </Box>
         ))}
-      </Box>
-      <Box flexDirection="column" marginTop={1}>
-        {empty ? <Text color={color.dim}>{plural(empty, 'other repo')} had no keys.</Text> : null}
+        {rows.length > max ? (
+          <Text color={c.dim}>
+            {offset + shown.length} of {rows.length} repos · scroll for more
+          </Text>
+        ) : null}
+      </Scroll>
+      <Box flexDirection="column">
+        {scan.repos.length > rows.length ? <Text color={c.dim}>{plural(scan.repos.length - rows.length, 'other repo')} had no keys.</Text> : null}
         {manual.length ? (
-          <Text color={color.dim}>
-            * {[...new Set(manual.map((d) => rt.registry[d.cred.platform].name))].join(', ')} can't be rotated by API. Molly lists where they're used at the end.
+          <Text color={c.dim}>
+            * {[...new Set(manual.map((d) => rt.registry[d.cred.platform].name))].join(', ')} have no rotation API, so Molly can't rotate them. You'll get links at the end.
           </Text>
         ) : null}
       </Box>
-      <Box marginTop={1} flexDirection="column">
-        {auto.length ? (
-          <>
-            <Text>
-              Rotate <Text bold>{plural(auto.length, 'key')}</Text> across{' '}
-              <Text bold>{plural(new Set(auto.flatMap((d) => d.hits.map((h) => h.repo.root))).size, 'repo')}</Text>?
+    </Frame>
+  );
+}
+
+function ChooseScreen({ rt, drafts, onSubmit, onBack }: { rt: Runtime; drafts: Draft[]; onSubmit: (d: Draft[]) => void; onBack: () => void }) {
+  const { rows: height } = useWindowSize();
+  const [selected, setSelected] = useState(() => new Set(drafts.map((d) => d.cred.id)));
+  const [cursor, setCursor] = useCursor(drafts.length);
+  const toggle = (id: string) =>
+    setSelected((s) => {
+      const n = new Set(s);
+      n.has(id) ? n.delete(id) : n.add(id);
+      return n;
+    });
+  useInput((input) => {
+    if (input === ' ') toggle(drafts[cursor].cred.id);
+  });
+  const view = visible(drafts, cursor, Math.max(4, height - 12));
+  const picked = drafts.filter((d) => selected.has(d.cred.id));
+  return (
+    <Frame
+      buttons={[
+        { label: `Rotate ${plural(picked.length, 'key')}`, primary: true, disabled: !picked.length, onPress: () => onSubmit(picked) },
+        {
+          label: selected.size === drafts.length ? 'Select none' : 'Select all',
+          hotkey: 'a',
+          onPress: () => setSelected(selected.size === drafts.length ? new Set() : new Set(drafts.map((d) => d.cred.id))),
+        },
+        { label: 'Back', hotkey: 'b', onPress: onBack },
+      ]}
+      hint="space or click to toggle"
+    >
+      <Title sub="Everything is selected. Untick anything you want to leave alone.">Which keys should Molly rotate?</Title>
+      {view.items.map((d, i) => {
+        const on = selected.has(d.cred.id);
+        const idx = view.start + i;
+        return (
+          <Row key={d.cred.id} active={idx === cursor} onClick={() => (setCursor(idx), toggle(d.cred.id))}>
+            <Text wrap="truncate-end">
+              <Text color={on ? c.ok : c.dim}>{on ? '☑' : '☐'}</Text> <Text bold>{rt.registry[d.cred.platform].name.padEnd(19)}</Text>
+              {fit(d.cred.label, 30)}
+              <Text color={c.dim}>
+                {plural(d.cred.targets.length, 'place')} · {d.repos.join(', ')}
+              </Text>
             </Text>
-            <Text color={color.dim}>Molly connects to each platform, rotates its keys, updates every repo, and checks in with you after each one.</Text>
-            <Hints hints={[['enter', 'start'], ['c', 'choose which'], ['q', 'quit']]} />
-          </>
-        ) : (
-          <Hints hints={[['enter', 'exit']]} />
-        )}
-      </Box>
-    </Box>
+          </Row>
+        );
+      })}
+    </Frame>
   );
 }
 
 // ─── Logging in ────────────────────────────────────────────────────────────
 
 /**
- * Makes sure Molly can talk to a platform. Reuses existing logins, runs the platform's own browser
+ * Makes sure Molly can talk to a platform: reuses existing logins, runs the platform's own browser
  * login when its CLI is installed, and only falls back to asking for an admin key.
  */
 function AuthGate({
   rt,
   provider,
   why,
+  header,
   openUrl,
   onDone,
 }: {
   rt: Runtime;
   provider: Provider;
   why: string;
+  header?: React.ReactNode;
   openUrl: (u: string) => void;
   onDone: (ok: boolean, label?: string) => void;
 }) {
   const { suspendTerminal } = useApp();
+  const mouse = useMouseInput();
   const required = (provider.auth ?? []).filter((f) => !f.optional);
   const [mode, setMode] = useState<'checking' | 'login' | 'paste'>('checking');
   const [cli, setCli] = useState(false);
@@ -425,7 +562,7 @@ function AuthGate({
 
   const startPaste = () => {
     if (!required.length) {
-      setError((e) => e || `Log in to ${provider.name} first, then press enter.`);
+      setError((e) => e || `Log in to ${provider.name} in another terminal, then check again.`);
       setMode('login');
       return;
     }
@@ -438,123 +575,140 @@ function AuthGate({
     }
   };
 
+  const browserLogin = async () => {
+    mouse?.stop();
+    await suspendTerminal(() => provider.cliLogin!.run());
+    mouse?.start();
+    void check();
+  };
+
+  const submitField = () => {
+    const field = required[fieldIdx];
+    if (!value.trim()) return;
+    entered.current[field.key] = value.trim();
+    setValue('');
+    setError('');
+    if (fieldIdx + 1 < required.length) setFieldIdx(fieldIdx + 1);
+    else void check();
+  };
+
   useEffect(() => {
     void check();
   }, []);
-
-  useInput(
-    (input, key) => {
-      if (mode === 'login') {
-        if (key.return) {
-          if (cli) void suspendTerminal(() => provider.cliLogin!.run()).then(check);
-          else void check();
-        } else if (input === 'k' && cli && required.length) startPaste();
-        else if (input === 's' || key.escape) onDone(false);
-      } else if (mode === 'paste' && key.escape) onDone(false);
-    },
-    { isActive: mode !== 'checking' },
-  );
   usePaste((text) => setValue((v) => v + text.trim()), { isActive: mode === 'paste' });
 
-  if (mode === 'checking') return <Working label={`Connecting to ${provider.name}…`} />;
-
   const field = required[fieldIdx];
+  const buttons =
+    mode === 'checking'
+      ? []
+      : mode === 'login'
+        ? [
+            { label: cli ? `Log in with ${provider.cliLogin!.label}` : 'Check again', primary: true, onPress: cli ? browserLogin : check },
+            ...(cli && required.length ? [{ label: 'Use an API key', hotkey: 'k', onPress: startPaste }] : []),
+            { label: `Skip ${provider.name}`, hotkey: 's', onPress: () => onDone(false) },
+          ]
+        : [
+            { label: 'Connect', primary: true, onPress: submitField },
+            ...(provider.loginUrl ? [{ label: 'Open page again', onPress: () => openUrl(provider.loginUrl!) }] : []),
+            { label: `Skip ${provider.name}`, hotkey: 'esc', onPress: () => onDone(false) },
+          ];
+
   return (
-    <Box flexDirection="column" borderStyle="round" borderColor={color.brand} paddingX={1}>
-      <Text>
-        <Text bold color={color.brand}>
-          Log in to {provider.name}
-        </Text>
-        <Text color={color.dim}>  {why}</Text>
-      </Text>
-      {error ? <Text color={color.warn}>{error}</Text> : null}
-      {mode === 'login' ? (
-        <Box flexDirection="column" marginTop={1}>
-          {cli ? <Text>Press enter and Molly will open the {provider.cliLogin!.label} login in your browser.</Text> : null}
-          <Hints
-            hints={[
-              ['enter', cli ? 'log in' : 'check again'],
-              ...(cli && required.length ? ([['k', 'use an API key instead']] as [string, string][]) : []),
-              ['s', `skip ${provider.name}`],
-            ]}
-          />
-        </Box>
+    <Frame buttons={buttons} typing={mode === 'paste'}>
+      {header}
+      {mode === 'checking' ? (
+        <Busy label={`Connecting to ${provider.name}…`} />
       ) : (
-        <Box flexDirection="column" marginTop={1}>
-          <Text>
-            {provider.name} has no browser login for tools, so it needs a <Text bold>{field.label}</Text> once.
-          </Text>
-          {provider.loginUrl ? (
-            <Text color={color.dim}>
-              {rt.demo ? 'Create one at ' : 'Opened '}
-              {provider.loginUrl}
-              {field.help ? ` · ${field.help}` : ''}
-            </Text>
-          ) : field.help ? (
-            <Text color={color.dim}>{field.help}</Text>
+        <Card title={`Log in to ${provider.name}`} right={why}>
+          {error ? (
+            <Box marginBottom={1}>
+              <Text color={c.warn}>{error}</Text>
+            </Box>
           ) : null}
-          <Text color={color.dim}>Saved in your macOS keychain, so you only do this once.</Text>
-          <Box marginTop={1}>
-            <Text color={color.brand}>❯ </Text>
-            <TextInput
-              value={value}
-              mask={field.secret ? '•' : undefined}
-              placeholder={field.secret ? 'paste it here' : ''}
-              onChange={setValue}
-              onSubmit={(v) => {
-                if (!v.trim()) return;
-                entered.current[field.key] = v.trim();
-                setValue('');
-                setError('');
-                if (fieldIdx + 1 < required.length) setFieldIdx(fieldIdx + 1);
-                else void check();
-              }}
-            />
-          </Box>
-          <Hints hints={[['enter', 'connect'], ['esc', `skip ${provider.name}`]]} />
-        </Box>
+          {mode === 'login' ? (
+            <Text>
+              {cli
+                ? `Molly will open the ${provider.cliLogin!.label} login in your browser. Approve it there, then come back here.`
+                : `Molly couldn't find a ${provider.name} login.`}
+            </Text>
+          ) : (
+            <Box flexDirection="column">
+              <Text>
+                {provider.name} doesn't offer a browser login for tools, so Molly needs a <Text bold>{field.label}</Text>. You only do this once.
+              </Text>
+              {provider.loginUrl ? (
+                <Text color={c.dim}>
+                  {rt.demo ? 'Create one at ' : 'Opened '}
+                  {provider.loginUrl} in your browser.
+                </Text>
+              ) : null}
+              {field.help ? <Text color={c.dim}>{field.help}</Text> : null}
+              <Box marginTop={1} borderStyle="round" borderColor={c.dim} paddingX={1}>
+                <Text color={c.brand}>❯ </Text>
+                <TextInput value={value} mask={field.secret ? '•' : undefined} placeholder="paste it here" onChange={setValue} onSubmit={submitField} />
+              </Box>
+              <Text color={c.dim}>Stored in your macOS keychain. Molly only uses it to create and revoke keys.</Text>
+            </Box>
+          )}
+        </Card>
       )}
-    </Box>
+    </Frame>
   );
 }
 
-function HostsStep({ rt, needed, openUrl, onDone }: { rt: Runtime; needed: string[]; openUrl: (u: string) => void; onDone: (connected: string[]) => void }) {
+function HostsScreen({ rt, needed, openUrl, onDone }: { rt: Runtime; needed: string[]; openUrl: (u: string) => void; onDone: (connected: string[]) => void }) {
   const [i, setI] = useState(0);
   const connected = useRef<string[]>([]);
-  const [lines, setLines] = useState<string[]>([]);
+  const [lines, setLines] = useState<{ ok: boolean; text: string }[]>([]);
   useEffect(() => {
     if (i >= needed.length) onDone(connected.current);
   }, [i]);
   const host = rt.registry[needed[i]];
-  return (
-    <Box flexDirection="column">
+  const header = (
+    <Box flexDirection="column" marginBottom={1}>
+      <Title sub="Your repos also keep secrets here. Connecting lets Molly update them in the same pass.">Connect where your secrets live</Title>
       {lines.map((l) => (
-        <Text key={l}>{l}</Text>
+        <Text key={l.text}>
+          <Text color={l.ok ? c.ok : c.dim}>{l.ok ? '✓' : '–'}</Text> {l.text}
+        </Text>
       ))}
-      {host && (
-        <AuthGate
-          key={host.id}
-          rt={rt}
-          provider={host}
-          openUrl={openUrl}
-          why={host.id === 'github' ? 'so Molly can update your repos’ Actions secrets' : 'so Molly can update your projects’ env vars'}
-          onDone={(ok, label) => {
-            if (ok) connected.current.push(host.id);
-            setLines((l) => [...l, ok ? `✓ ${host.name}${label ? `  ${label}` : ''}` : `– ${host.name} skipped: Molly will only update local files`]);
-            setI(i + 1);
-          }}
-        />
-      )}
     </Box>
+  );
+  if (!host)
+    return (
+      <Frame>
+        {header}
+        <Busy label="Continuing…" />
+      </Frame>
+    );
+  return (
+    <AuthGate
+      key={host.id}
+      rt={rt}
+      provider={host}
+      header={header}
+      openUrl={openUrl}
+      why={host.id === 'github' ? 'to update Actions secrets' : 'to update env vars'}
+      onDone={(ok, label) => {
+        if (ok) connected.current.push(host.id);
+        setLines((l) => [...l, ok ? { ok, text: `${host.name}${label ? `  ${label}` : ''}` } : { ok, text: `${host.name} skipped: only local files will be updated` }]);
+        setI(i + 1);
+      }}
+    />
   );
 }
 
-function LinkStep({ rt, scan, hosts, onDone }: { rt: Runtime; scan: Discovery; hosts: string[]; onDone: () => void }) {
+function LinkScreen({ rt, scan, hosts, onDone }: { rt: Runtime; scan: Discovery; hosts: string[]; onDone: () => void }) {
   const [msg, setMsg] = useState('Finding where each key is used…');
   useEffect(() => {
     linkRemotes(rt, scan, hosts, setMsg).then(onDone);
   }, []);
-  return <Working label={msg} />;
+  return (
+    <Frame>
+      <Title sub="Matching your keys to GitHub secrets and Vercel env vars">Getting ready</Title>
+      <Busy label={msg} />
+    </Frame>
+  );
 }
 
 // ─── 3. One platform at a time ─────────────────────────────────────────────
@@ -562,22 +716,20 @@ function LinkStep({ rt, scan, hosts, onDone }: { rt: Runtime; scan: Discovery; h
 interface CredView {
   status: 'pending' | 'active' | Outcome;
   step?: Step;
+  seen: Step[];
   targets: Record<number, { status: 'ok' | 'error' | 'skipped'; message?: string }>;
   message?: string;
   followUps: string[];
 }
 
-const STEP_LABEL: Record<Step, string> = {
-  resolve: 'Finding the current key',
-  issue: 'Creating a new key',
-  prompt: 'Waiting',
-  verify: 'Checking the new key works',
-  propagate: 'Updating your repos',
-  revoke: 'Revoking the old key',
-  redeploy: 'Redeploying',
-};
+const PIPELINE: { label: string; steps: Step[] }[] = [
+  { label: 'Create', steps: ['resolve', 'issue'] },
+  { label: 'Check', steps: ['verify'] },
+  { label: 'Update', steps: ['propagate'] },
+  { label: 'Revoke', steps: ['revoke'] },
+];
 
-function PlatformStep({
+function PlatformScreen({
   rt,
   index,
   total,
@@ -589,6 +741,7 @@ function PlatformStep({
   save,
   openUrl,
   next,
+  onProgress,
   onDone,
 }: {
   rt: Runtime;
@@ -602,32 +755,30 @@ function PlatformStep({
   save: () => Promise<void>;
   openUrl: (u: string) => void;
   next?: string;
-  onDone: (results: Record<string, { outcome: Outcome; note?: string; followUps: string[] }>) => void;
+  onProgress: (r: Results) => void;
+  onDone: (r: Results) => void;
 }) {
+  const { rows: height } = useWindowSize();
   const [mode, setMode] = useState<'auth' | 'prepare' | 'question' | 'rotate' | 'result'>(provider.auth?.length ? 'auth' : 'prepare');
   const [account, setAccount] = useState<string>();
   const [questions, setQuestions] = useState<{ cred: CredentialSpec; q: Question }[]>([]);
   const [qIndex, setQIndex] = useState(0);
   const [views, setViews] = useState<Record<string, CredView>>(() =>
-    Object.fromEntries(drafts.map((d) => [d.cred.id, { status: 'pending', targets: {}, followUps: [] }])),
+    Object.fromEntries(drafts.map((d) => [d.cred.id, { status: 'pending', seen: [], targets: {}, followUps: [] }])),
   );
   const prepFailures = useRef<Record<string, string>>({});
+  const q = questions[qIndex];
+  const [qCursor, setQCursor] = useCursor(q?.q.options.length ?? 0, mode === 'question');
 
-  const results = () =>
+  const resultsFrom = (v: Record<string, CredView>): Results =>
     Object.fromEntries(
       drafts.map((d) => {
-        const v = views[d.cred.id];
-        const outcome: Outcome = v.status === 'pending' || v.status === 'active' ? 'skipped' : v.status;
-        return [d.cred.id, { outcome, note: v.message, followUps: v.followUps }];
+        const s = v[d.cred.id];
+        const outcome: Outcome = s.status === 'pending' || s.status === 'active' ? 'skipped' : s.status;
+        return [d.cred.id, { outcome, note: s.message, followUps: s.followUps }];
       }),
     );
 
-  const skipAll = (why: string) => {
-    const out = Object.fromEntries(drafts.map((d) => [d.cred.id, { outcome: 'skipped' as Outcome, note: why, followUps: [] }]));
-    onDone(out);
-  };
-
-  // Fill in per-key details (which project, which IAM user…) now that Molly can talk to the platform.
   useEffect(() => {
     if (mode !== 'prepare') return;
     (async () => {
@@ -649,100 +800,124 @@ function PlatformStep({
   useEffect(() => {
     if (mode !== 'rotate') return;
     (async () => {
+      let latest = views;
+      const update = (fn: (v: Record<string, CredView>) => Record<string, CredView>) => {
+        latest = fn(latest);
+        setViews(latest);
+      };
       for (const d of drafts) {
         if (prepFailures.current[d.cred.id]) {
-          setViews((v) => ({ ...v, [d.cred.id]: { ...v[d.cred.id], status: 'failed', message: prepFailures.current[d.cred.id] } }));
+          update((v) => ({ ...v, [d.cred.id]: { ...v[d.cred.id], status: 'failed', message: prepFailures.current[d.cred.id] } }));
           continue;
         }
-        await rollCredential(
-          rt,
-          config,
-          d.cred,
-          { emit: (e) => setViews((v) => applyEvent(v, e)), prompt: async () => null },
-          opts,
-          touched,
-          save,
-        );
+        await rollCredential(rt, config, d.cred, { emit: (e) => update((v) => applyEvent(v, e)), prompt: async () => null }, opts, touched, save);
+        onProgress(resultsFrom(latest));
       }
       setMode('result');
     })();
   }, [mode]);
 
-  useInput(
-    (input, key) => {
-      if (mode === 'result' && (key.return || input === ' ')) onDone(results());
-    },
-    { isActive: mode === 'result' },
-  );
+  const answer = (value: string) => {
+    q.cred.params[q.q.param] = value;
+    if (qIndex + 1 < questions.length) setQIndex(qIndex + 1);
+    else void save().then(() => setMode('rotate'));
+  };
 
   const places = drafts.reduce((n, d) => n + d.cred.targets.length, 0);
   const repos = [...new Set(drafts.flatMap((d) => d.repos))];
-  const allOk = drafts.every((d) => views[d.cred.id].status === 'rolled');
-
-  return (
-    <Box flexDirection="column">
-      <Text>
-        <Text color={color.dim}>
-          {index + 1}/{total}{'  '}
-        </Text>
-        <Text bold color={color.brand}>
+  const header = (
+    <Box justifyContent="space-between" marginBottom={1}>
+      <Box flexDirection="column">
+        <Text bold color={c.brand}>
           {provider.name}
         </Text>
-        <Text color={color.dim}>
-          {'  '}
+        <Text color={c.dim}>
           {plural(drafts.length, 'key')} · {plural(places, 'place')} · {repos.join(', ')}
           {account ? ` · ${account}` : ''}
         </Text>
-      </Text>
-      {provider.warning && mode !== 'result' ? <Text color={color.dim}>{provider.warning}</Text> : null}
-
-      <Box flexDirection="column" marginTop={1}>
-        {mode === 'auth' && (
-          <AuthGate
-            rt={rt}
-            provider={provider}
-            openUrl={openUrl}
-            why="so Molly can create the new key and revoke the old one"
-            onDone={(ok, label) => {
-              if (!ok) return skipAll('skipped (not logged in)');
-              setAccount(label);
-              setMode('prepare');
-            }}
-          />
-        )}
-        {mode === 'prepare' && <Working label={`Looking up your ${provider.name} account…`} />}
-        {mode === 'question' && questions[qIndex] && (
-          <Box flexDirection="column">
-            <Text bold>{questions[qIndex].q.prompt}</Text>
-            <Select
-              key={qIndex}
-              options={questions[qIndex].q.options}
-              onSubmit={(v) => {
-                questions[qIndex].cred.params[questions[qIndex].q.param] = v;
-                if (qIndex + 1 < questions.length) setQIndex(qIndex + 1);
-                else void save().then(() => setMode('rotate'));
-              }}
-            />
-          </Box>
-        )}
-        {(mode === 'rotate' || mode === 'result') &&
-          drafts.map((d) => <CredRow key={d.cred.id} cred={d.cred} view={views[d.cred.id]} />)}
       </Box>
-
-      {mode === 'result' && (
-        <Box flexDirection="column" marginTop={1}>
-          <Text bold color={allOk ? color.ok : color.warn}>
-            {allOk ? `✓ ${provider.name} rotated` : `◐ ${provider.name} needs attention`}
-          </Text>
-          {drafts.flatMap((d) => views[d.cred.id].followUps).map((f, i) => (
-            <Text key={i} color={color.dim}>
-              • {f}
-            </Text>
-          ))}
-          <Hints hints={[['enter', next ? `next: ${next}` : 'finish']]} />
-        </Box>
-      )}
+      <Text color={c.dim}>
+        platform {index + 1} of {total}
+      </Text>
     </Box>
+  );
+
+  if (mode === 'auth') {
+    return (
+      <AuthGate
+        rt={rt}
+        provider={provider}
+        header={header}
+        openUrl={openUrl}
+        why="to create the new key and revoke the old one"
+        onDone={(ok, label) => {
+          if (!ok) return onDone(Object.fromEntries(drafts.map((d) => [d.cred.id, { outcome: 'skipped' as Outcome, note: 'skipped (not logged in)', followUps: [] }])));
+          setAccount(label);
+          setMode('prepare');
+        }}
+      />
+    );
+  }
+
+  if (mode === 'prepare') {
+    return (
+      <Frame>
+        {header}
+        <Busy label={`Looking up your ${provider.name} account…`} />
+      </Frame>
+    );
+  }
+
+  if (mode === 'question' && q) {
+    return (
+      <Frame buttons={[{ label: 'Choose', primary: true, onPress: () => answer(q.q.options[qCursor].value) }]}>
+        {header}
+        <Title>{q.q.prompt}</Title>
+        {q.q.options.map((o, i) => (
+          <Row key={o.value} active={i === qCursor} onClick={() => (setQCursor(i), answer(o.value))}>
+            <Text bold={i === qCursor}>{o.label}</Text>
+          </Row>
+        ))}
+      </Frame>
+    );
+  }
+
+  const done = mode === 'result';
+  const allOk = drafts.every((d) => views[d.cred.id].status === 'rolled');
+  const followUps = drafts.flatMap((d) => views[d.cred.id].followUps);
+  const revoked = drafts.some((d) => views[d.cred.id].seen.includes('revoke'));
+  const budget = Math.max(3, height - 18 - drafts.length * 3);
+
+  return (
+    <Frame
+      buttons={done ? [{ label: next ? `Next: ${next} →` : 'See summary →', primary: true, onPress: () => onDone(resultsFrom(views)) }] : []}
+      hint={done ? undefined : 'working…'}
+    >
+      {header}
+      {done ? (
+        <Box marginBottom={1} flexDirection="column">
+          <Card tone={allOk ? 'ok' : 'warn'}>
+            <Text bold color={allOk ? c.ok : c.warn}>
+              {allOk ? `✓ ${provider.name} rotated` : `◐ ${provider.name} needs attention`}
+            </Text>
+            {allOk ? (
+              <Text color={c.dim}>
+                {drafts.length === 1 ? 'New key' : `${drafts.length} new keys`} in {plural(places, 'place')}
+                {revoked ? ' · old key revoked' : ''}
+              </Text>
+            ) : null}
+            {followUps.map((f, i) => (
+              <Text key={i} color={c.warn}>
+                • {f}
+              </Text>
+            ))}
+          </Card>
+        </Box>
+      ) : null}
+      {drafts.map((d) => (
+        <CredCard key={d.cred.id} cred={d.cred} view={views[d.cred.id]} compact={done && views[d.cred.id].status === 'rolled'} budget={budget} />
+      ))}
+    </Frame>
   );
 }
 
@@ -753,7 +928,7 @@ function applyEvent(v: Record<string, CredView>, e: RollEvent): Record<string, C
     case 'cred-start':
       return { ...v, [e.id]: { ...cur, status: 'active' } };
     case 'step':
-      return { ...v, [e.id]: { ...cur, step: e.step } };
+      return { ...v, [e.id]: { ...cur, step: e.step, seen: [...cur.seen, e.step] } };
     case 'target':
       return { ...v, [e.id]: { ...cur, targets: { ...cur.targets, [e.index]: { status: e.status, message: e.message } } } };
     case 'cred-done':
@@ -761,37 +936,67 @@ function applyEvent(v: Record<string, CredView>, e: RollEvent): Record<string, C
   }
 }
 
-function CredRow({ cred, view }: { cred: CredentialSpec; view: CredView }) {
-  const icon = { pending: '○', rolled: '✓', partial: '◐', failed: '✗', skipped: '–' } as const;
-  const tint = { pending: color.dim, active: color.brand, rolled: color.ok, partial: color.warn, failed: color.err, skipped: color.dim };
-  const showTargets = view.status === 'active' ? view.step === 'propagate' || view.step === 'revoke' : view.status !== 'pending';
-  return (
-    <Box flexDirection="column">
+function CredCard({ cred, view, compact, budget }: { cred: CredentialSpec; view: CredView; compact: boolean; budget: number }) {
+  const total = cred.targets.length;
+  const ok = Object.values(view.targets).filter((t) => t.status === 'ok').length;
+  const icon = { pending: '○', active: '◉', rolled: '✓', partial: '◐', failed: '✗', skipped: '–' }[view.status];
+  const tint = { pending: c.dim, active: c.brand, rolled: c.ok, partial: c.warn, failed: c.err, skipped: c.dim }[view.status];
+
+  if (compact || view.status === 'pending' || view.status === 'skipped') {
+    return (
       <Text>
-        <Text color={tint[view.status]}>{view.status === 'active' ? <Spinner type="dots" /> : icon[view.status]}</Text>{' '}
-        <Text bold>{cred.label}</Text>
-        {view.status === 'active' && view.step ? <Text color={color.dim}>  {STEP_LABEL[view.step]}…</Text> : null}
-        {view.status === 'failed' ? <Text color={color.err}>  {view.message}</Text> : null}
+        <Text color={tint}>{icon}</Text> <Text bold>{cred.label}</Text>
+        <Text color={c.dim}>  {view.status === 'rolled' ? `${plural(total, 'place')} updated` : view.status === 'pending' ? 'waiting' : view.message ?? ''}</Text>
       </Text>
-      {showTargets &&
-        cred.targets.map((t, i) => {
-          const s = view.targets[i];
-          return (
-            <Text key={i} color={s?.status === 'error' ? color.err : color.dim}>
-              {'    '}
-              {s ? s.status === 'ok' ? <Text color={color.ok}>✓</Text> : '✗' : '·'} {tildify(describeTarget(t))}  {t.key}
-              {s?.message ? `: ${s.message}` : ''}
-            </Text>
-          );
-        })}
-      {view.status === 'partial' && view.message ? <Text color={color.warn}>    {view.message}</Text> : null}
+    );
+  }
+
+  const stage = PIPELINE.findIndex((p) => view.step && p.steps.includes(view.step));
+  const finished = view.status !== 'active';
+  const targets = cred.targets.map((t, i) => ({ t, s: view.targets[i] }));
+  const failedFirst = [...targets.filter((x) => x.s?.status === 'error'), ...targets.filter((x) => x.s?.status !== 'error')];
+  const shown = failedFirst.slice(0, budget);
+
+  return (
+    <Box marginBottom={1} flexDirection="column">
+      <Card tone={view.status === 'failed' ? 'warn' : view.status === 'partial' ? 'warn' : 'brand'} title={cred.label} right={finished ? undefined : 'working…'}>
+        <Text>
+          {PIPELINE.map((p, i) => {
+            const state = finished ? (view.seen.some((s) => p.steps.includes(s)) ? 'done' : 'skip') : i < stage ? 'done' : i === stage ? 'now' : 'todo';
+            return (
+              <Text key={p.label}>
+                {i ? <Text color={c.dim}> ─ </Text> : null}
+                <Text color={state === 'done' ? c.ok : state === 'now' ? c.brand : c.dim}>{state === 'done' ? '●' : state === 'now' ? '◉' : '○'}</Text>{' '}
+                <Text color={state === 'todo' || state === 'skip' ? c.dim : undefined} bold={state === 'now'}>
+                  {p.label}
+                </Text>
+              </Text>
+            );
+          })}
+        </Text>
+        {view.status === 'failed' ? (
+          <Text color={c.err}>{view.message}</Text>
+        ) : (
+          <Box marginTop={1} flexDirection="column">
+            <Bar value={ok} total={total} />
+            {shown.map(({ t, s }, i) => (
+              <Text key={i} color={s?.status === 'error' ? c.err : c.dim} wrap="truncate-end">
+                {s ? s.status === 'ok' ? <Text color={c.ok}>✓</Text> : '✗' : '·'} {tildify(describeTarget(t))}  {t.key}
+                {s?.message ? `: ${s.message}` : ''}
+              </Text>
+            ))}
+            {targets.length > shown.length ? <Text color={c.dim}>  +{targets.length - shown.length} more</Text> : null}
+            {view.status === 'partial' && view.message ? <Text color={c.warn}>{view.message}</Text> : null}
+          </Box>
+        )}
+      </Card>
     </Box>
   );
 }
 
 // ─── 4. Wrap up ────────────────────────────────────────────────────────────
 
-function RedeployStep({
+function RedeployScreen({
   rt,
   projects,
   onDone,
@@ -814,20 +1019,37 @@ function RedeployStep({
     }
     onDone(lines);
   };
-  if (running) return <Working label="Redeploying…" />;
   return (
-    <Text>
-      Redeploy {projects.map((p) => p.name).join(', ')} on Vercel so production picks up the new keys? <Confirm onAnswer={run} />
-    </Text>
+    <Frame
+      buttons={
+        running
+          ? []
+          : [
+              { label: 'Redeploy now', primary: true, onPress: () => void run(true) },
+              { label: 'Not now', hotkey: 'n', onPress: () => void run(false) },
+            ]
+      }
+    >
+      <Title sub="Vercel only picks up new env values on the next deployment.">Redeploy on Vercel?</Title>
+      {running ? (
+        <Busy label="Redeploying…" />
+      ) : (
+        <Card title="Production deployments">
+          {projects.map((p) => (
+            <Text key={p.projectId}>• {p.name}</Text>
+          ))}
+        </Card>
+      )}
+    </Frame>
   );
 }
 
-function Summary({
+function SummaryScreen({
   rt,
   scan,
   chosen,
   manual,
-  outcomes,
+  results,
   redeploys,
   onExit,
 }: {
@@ -835,65 +1057,56 @@ function Summary({
   scan: Discovery;
   chosen: Draft[];
   manual: Draft[];
-  outcomes: Record<string, { outcome: Outcome; note?: string; followUps: string[] }>;
+  results: Results;
   redeploys: string[];
   onExit: () => void;
 }) {
-  useInput((input, key) => (key.return || input === 'q' || key.escape) && onExit());
-  const rolled = Object.values(outcomes).filter((o) => o.outcome === 'rolled').length;
-  const mark = { rolled: ['✓', color.ok], partial: ['◐', color.warn], failed: ['✗', color.err], skipped: ['–', color.dim] } as const;
-  const repos = scan.repos.filter((r) => [...chosen, ...manual].some((d) => d.hits.some((h) => h.repo === r)));
-  const nameW = Math.min(28, Math.max(8, ...repos.map((r) => r.name.length)) + 2);
-  const followUps = chosen.flatMap((d) => (outcomes[d.cred.id]?.followUps ?? []).map((f) => `${serviceName(rt, d)}: ${f}`));
-  const problems = chosen.filter((d) => ['failed', 'partial'].includes(outcomes[d.cred.id]?.outcome));
+  const rolled = Object.values(results).filter((o) => o.outcome === 'rolled').length;
+  const repos = scan.repos.filter((r) => [...chosen, ...manual].some((d) => touches(d, r)));
+  const nameW = Math.min(26, Math.max(10, ...repos.map((r) => r.name.length)) + 2);
+  const followUps = chosen.flatMap((d) => (results[d.cred.id]?.followUps ?? []).map((f) => `${serviceName(rt, d)}: ${f}`));
+  const problems = chosen.filter((d) => ['failed', 'partial'].includes(results[d.cred.id]?.outcome));
+  const tone = { rolled: 'ok', partial: 'warn', failed: 'err', skipped: 'dim' } as const;
+  const mark = { rolled: '✓', partial: '◐', failed: '✗', skipped: '–' } as const;
 
   return (
-    <Box flexDirection="column">
-      <Text bold color={problems.length ? color.warn : color.ok}>
+    <Frame buttons={[{ label: 'Done', primary: true, onPress: onExit }]}>
+      <Title sub="Next time, just run molly. Your folder and logins are saved, so it goes straight to rotating.">
         {problems.length ? '◐' : '✓'} Rotated {rolled} of {plural(chosen.length, 'key')}
-      </Text>
-      <Box flexDirection="column" marginTop={1}>
-        {repos.map((repo) => {
-          const mine = chosen.filter((d) => d.hits.some((h) => h.repo === repo));
-          const theirs = [...new Set(manual.filter((d) => d.hits.some((h) => h.repo === repo)).map((d) => serviceName(rt, d)))];
-          return (
-            <Text key={repo.root}>
-              <Text bold>{repo.name.slice(0, nameW - 2).padEnd(nameW)}</Text>
-              {mine.map((d, i) => {
-                const [icon, c] = mark[outcomes[d.cred.id]?.outcome ?? 'skipped'];
-                return (
-                  <Text key={d.cred.id}>
-                    {i ? '  ' : ''}
-                    <Text color={c}>{icon}</Text> {serviceName(rt, d)}
-                  </Text>
-                );
+      </Title>
+      {repos.map((repo) => (
+        <Box key={repo.root} marginBottom={1}>
+          <Box width={nameW} flexShrink={0}>
+            <Text bold wrap="truncate-end">
+              {repo.name}
+            </Text>
+          </Box>
+          <Box flexGrow={1} flexWrap="wrap">
+            {chosen
+              .filter((d) => touches(d, repo))
+              .map((d) => {
+                const o = results[d.cred.id]?.outcome ?? 'skipped';
+                return <Chip key={d.cred.id} label={`${mark[o]} ${serviceName(rt, d)}`} tone={tone[o]} />;
               })}
-              {theirs.length ? <Text color={color.dim}>{mine.length ? '  ' : ''}○ {theirs.join(', ')} (manual)</Text> : null}
-            </Text>
-          );
-        })}
-      </Box>
-      {redeploys.length ? (
-        <Box flexDirection="column" marginTop={1}>
-          {redeploys.map((l) => (
-            <Text key={l}>{l}</Text>
-          ))}
+            {[...new Set(manual.filter((d) => touches(d, repo)).map((d) => serviceName(rt, d)))].map((s) => (
+              <Chip key={s} label={`○ ${s}`} tone="dim" />
+            ))}
+          </Box>
         </Box>
-      ) : null}
-      {problems.length ? (
-        <Box flexDirection="column" marginTop={1}>
-          {problems.map((d) => (
-            <Text key={d.cred.id} color={color.warn}>
-              • {serviceName(rt, d)} {d.cred.label}: {outcomes[d.cred.id].note}
-            </Text>
-          ))}
-        </Box>
-      ) : null}
+      ))}
+      {redeploys.map((l) => (
+        <Text key={l}>{l}</Text>
+      ))}
+      {problems.map((d) => (
+        <Text key={d.cred.id} color={c.warn}>
+          • {serviceName(rt, d)} {d.cred.label}: {results[d.cred.id].note}
+        </Text>
+      ))}
       {followUps.length ? (
         <Box flexDirection="column" marginTop={1}>
           <Text bold>Left for you</Text>
           {followUps.map((f, i) => (
-            <Text key={i} color={color.dim}>
+            <Text key={i} color={c.dim}>
               • {f}
             </Text>
           ))}
@@ -901,21 +1114,14 @@ function Summary({
       ) : null}
       {manual.length ? (
         <Box flexDirection="column" marginTop={1}>
-          <Text bold>No rotation API</Text>
-          <Text color={color.dim}>These platforms only let you create keys in their dashboard:</Text>
+          <Text bold>Rotate these in their dashboards (no API)</Text>
           {[...new Set(manual.map((d) => d.cred.platform))].map((id) => (
-            <Text key={id} color={color.dim}>
-              • {rt.registry[id].name}: {rt.registry[id].dashboardUrl} ({manual.filter((d) => d.cred.platform === id).map((d) => d.cred.label).join(', ')})
+            <Text key={id} color={c.dim} wrap="truncate-end">
+              ○ {rt.registry[id].name}  <Text color={c.accent}>{rt.registry[id].dashboardUrl}</Text>
             </Text>
           ))}
         </Box>
       ) : null}
-      <Box marginTop={1}>
-        <Text color={color.dim}>
-          Next time just run <Text color={color.accent}>molly</Text>. Your logins are saved, so it goes straight to rotating.
-        </Text>
-      </Box>
-      <Hints hints={[['enter', 'done']]} />
-    </Box>
+    </Frame>
   );
 }
