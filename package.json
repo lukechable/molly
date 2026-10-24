@@ -1,7 +1,30 @@
 {
   "name": "molly",
   "version": "0.1.0",
-  "description": "Roll every API key and secret you own with one command: molly roll",
+  "description": "Rotate the API keys and secrets for all your projects with one command. Molly finds every key across your repos, rotates it through each platform’s API, and updates every .env file, GitHub secret and Vercel env var that uses it.",
+  "keywords": [
+    "secrets",
+    "api-keys",
+    "key-rotation",
+    "rotate",
+    "dotenv",
+    "env",
+    "github-actions",
+    "vercel",
+    "security",
+    "cli",
+    "tui",
+    "devtools"
+  ],
+  "homepage": "https://github.com/lukechable/molly#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lukechable/molly.git"
+  },
+  "bugs": {
+    "url": "https://github.com/lukechable/molly/issues"
+  },
+  "license": "MIT",
   "type": "module",
   "bin": {
     "molly": "dist/cli.js"
@@ -16,9 +39,9 @@
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/cli.tsx",
     "test": "vitest run",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prepare": "npm run build"
   },
-  "license": "MIT",
   "dependencies": {
     "@aws-sdk/client-iam": "^3.1156.0",
     "@aws-sdk/client-sts": "^3.1156.0",

@@ -1,21 +1,40 @@
 # molly
 
-Rotate every API key your repos use with one command: `molly`.
+**Rotate the API keys and secrets for all your projects with one command.**
+
+If you work on more than a handful of projects, your keys are scattered everywhere: the same OpenAI key in
+four repos' `.env` files, AWS credentials in a worker *and* its GitHub Actions secrets, a database URL in Vercel. You
+know you should rotate them. You don't, because doing it by hand means visiting every dashboard and then hunting down
+every copy.
+
+Molly does the whole thing:
 
 ```
 molly
 ```
 
-1. **Pick your work folder.** Molly suggests the folders on your machine that hold git repos.
-2. **See what each repo uses.** Molly reads every repo's `.env*` / `.dev.vars` files and shows which services each
-   one uses, plus where the repo also keeps secrets (GitHub Actions, Vercel).
-3. **Rotate, one platform at a time.** For each platform, Molly logs you in, creates a new key through the
-   platform's API, updates every repo that uses it, revokes the old key, and shows you ✓ before moving on.
+1. **Point it at your work folder** (the one holding all your repos). Molly finds every git repo inside.
+2. **See what each project uses.** Molly reads each repo's `.env*` files and shows, per repo, which services it
+   depends on and where else its secrets live (GitHub Actions, Vercel).
+3. **Rotate, platform by platform.** Molly logs in to each platform, gets a fresh key from its API, writes it to
+   **every** project and remote secret that used the old one, revokes the old key, and checks in with you before
+   moving on.
 
-You never paste a new key: the platform's API issues it. Next time, `molly` remembers your folder and logins and goes
-straight to rotating.
+One key shared by five projects is rotated **once** and updated in all five. You never copy or paste a new key:
+the platform's API issues it. Next time, `molly` remembers your folder and logins and goes straight to rotating.
 
-Try it safely first: `molly demo` builds three throwaway repos with fake keys and runs the whole flow.
+It's a full-screen terminal app: a sidebar of repos and platforms, live progress for every file and secret, and
+buttons you can click or press.
+
+## Install
+
+Requires Node 20+.
+
+```
+npm install -g github:lukechable/molly
+molly demo    # try it on throwaway repos with fake keys first
+molly         # the real thing
+```
 
 ## Logging in
 
@@ -80,14 +99,20 @@ Flags: `--keep-old` (revoke later with `molly finalize`) and `--force`. For CI, 
 the saved setup without prompts. `--only <platform>` and `--dry-run` work with `--plain`. Logins can come from env
 vars (`MOLLY_OPENAI_ADMIN_KEY`, `MOLLY_GITHUB_TOKEN`, …).
 
-## Development
+## Contributing
+
+Issues and pull requests are welcome, especially new platforms.
 
 ```
+git clone https://github.com/lukechable/molly && cd molly
 npm install
 npm run dev -- demo          # run from source
 npm test
-npm run build && npm link    # puts `molly` on your PATH
 ```
 
 To add a platform, implement `Provider` (`src/providers/types.ts`): `detect` finds its keys in env files, and
 `issue` / `revoke` / `verify` rotate them. Then register it in `src/providers/index.ts`.
+
+## License
+
+[MIT](LICENSE)
